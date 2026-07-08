@@ -22,18 +22,31 @@ scripts/preprocess_raw.py --dataset tuab \
 ## BCI2a -- 4-class motor imagery
 
 Source: [BCI Competition IV, dataset 2a](https://www.bbci.de/competition/iv/#dataset2a)
-(public, no registration).
+(public, no registration) -- `BCICIV_2a_gdf.zip`, one continuous GDF file per
+subject per session: `A0{1-9}T.gdf` (training) and `A0{1-9}E.gdf` (evaluation).
+
+Evaluation sessions carry no class labels themselves (the cue annotation is
+"783", unknown) -- the true labels were released after the competition as a
+separate per-session `A0{id}E.mat` file (field `classlabel`). If you only have
+the training sessions, that's fine: `--labels-dir` is only needed for `*E.gdf`.
 
 ```
-scripts/preprocess_raw.py --dataset bci2a --raw-dir data/raw/bci2a --out-dir data/processed/bci2a
+scripts/preprocess_raw.py --dataset bci2a \
+    --raw-dir data/raw/bci2a --labels-dir data/raw/bci2a_true_labels --out-dir data/processed/bci2a
 ```
 
-- `--raw-dir`: one EDF file per trial (already 5s-long), with the trial's class
-  name (`left_hand`, `right_hand`, `feet`, or `tongue`) in the EDF header's
-  `subject_info.his_id` field, and `train`/`test` in the filename
-  (e.g. `..._session-0train_...`). If your copy of the dataset ships the original
-  `.gdf` format instead, convert each trial to EDF with this same convention first
-  (e.g. via `mne.io.read_raw_gdf` + `mne.export.export_raw`).
+- `--raw-dir`: the `A0{1-9}T.gdf` / `A0{1-9}E.gdf` files, unmodified.
+- `--labels-dir`: `A0{id}E.mat` files (one per evaluation session), each with a
+  `classlabel` array (1-4, in trial order).
+
+Trials are cut as the 4s motor-imagery window starting at cue onset (t=2s to
+t=6s relative to trial start -- see the [dataset description PDF](http://bbci.de/competition/iv/desc_2a.pdf)).
+The 3 EOG channels are dropped (provided for artifact-correction methods only,
+not meant for classification). The original recording is already
+bandpass-filtered 0.5-100Hz with a 50Hz notch (European mains) by the
+amplifier -- `scripts/preprocess_raw.py` still re-applies its own 50Hz notch/
+high-pass/CAR/resample-to-128Hz on top, harmlessly idempotent-ish, for a
+consistent pipeline across all three datasets.
 
 ## TUEV -- 6-class event classification
 
