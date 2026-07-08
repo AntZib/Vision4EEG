@@ -4,7 +4,7 @@ import pandas as pd
 
 from src.data.bci2a import FS, TRIAL_SEC, extract_trials
 from src.data.tuab import load_metadata as load_tuab_metadata
-from src.data.tuev import label_for_window, load_annotations
+from src.data.tuev import PAD_SEC, extract_events, load_annotations
 from src.data.utils import parse_channels
 
 
@@ -38,13 +38,40 @@ def test_load_tuab_metadata_filters_by_label_and_duration(tmp_path):
     assert list(df["datalakeID"]) == ["a"]
 
 
-def test_tuev_label_for_window_local_parquet(tmp_path):
-    annot_path = tmp_path / "annots.parquet"
-    pd.DataFrame({"start": [0.0, 5.0], "stop": [5.0, 10.0], "label": ["bckg", "artf"]}).to_parquet(annot_path)
+def test_tuev_load_annotations_parses_headerless_rec_csv(tmp_path):
+    rec_path = tmp_path / "rec001.rec"
+    rec_path.write_text("0,10.0,11.0,6\n3,50.0,51.0,1\n")  # channel,start,stop,label_code
 
-    annots = load_annotations(str(annot_path))
-    assert label_for_window(annots, 0.0, 5.0) == "bckg"
-    assert label_for_window(annots, 4.0, 6.0) is None  # straddles the boundary at t=5
+    annots = load_annotations(str(rec_path))
+    assert list(annots["label_code"]) == [6.0, 1.0]
+    assert list(annots["start"]) == [10.0, 50.0]
+
+
+def test_tuev_extract_events_cuts_padded_window_around_each_event():
+    fs = 128.0
+    signal = np.zeros((int(20 * fs), 4), dtype=np.float32)
+    # one bckg (code 6) event at [10, 11]s, one spsw (code 1) event at [15, 16]s
+    annots = pd.DataFrame({"channel": [0, 3], "start": [10.0, 15.0], "stop": [11.0, 16.0], "label_code": [6, 1]})
+
+    events = extract_events(signal, fs, annots)
+    assert [label for label, _ in events] == ["bckg", "spsw"]
+    expected_len = int(round((1.0 + 2 * PAD_SEC) * fs))  # 1s event + PAD_SEC on each side
+    for _, window in events:
+        assert window.shape == (expected_len, 4)
+
+
+def test_tuev_extract_events_drops_and_caps():
+    fs = 128.0
+    signal = np.zeros((int(20 * fs), 4), dtype=np.float32)
+    annots = pd.DataFrame({
+        "channel": [0, 0, 0, 0],
+        "start": [0.5, 5.0, 8.0, 19.5],  # first and last too close to the recording's edges
+        "stop": [1.5, 6.0, 9.0, 19.6],
+        "label_code": [6, 6, 6, 6],  # all bckg
+    })
+
+    events = extract_events(signal, fs, annots, max_bckg=1)
+    assert len(events) == 1  # only one bckg kept (cap), the two near-edge ones were never candidates anyway
 
 
 def test_bci2a_extract_trials_train_session():

@@ -1,107 +1,122 @@
-"""TUEV (6-class event classification) metadata and annotation loading.
+"""TUEV (6-class event classification) metadata and raw ingestion.
 
-TUEV convention (matches BIOT/LaBraM/CBraMod preprocessing): windows are 5s, one per
-labeled interval, NOT a majority-vote sliding grid. Each TUAB-style 300s segment
-parquet is chunked into non-overlapping 5s windows; a window is kept only if it falls
-ENTIRELY within a single annotated interval (boundary-straddling windows are dropped,
-same as the literature convention -- avoids ambiguous/mixed-label windows).
+Official distribution (isip.piconepress.com/projects/tuh_eeg): one continuous
+EDF file per recording, laid out as root/{train,eval}/**/*.edf, each with a
+matching `.rec` file next to it (same basename) -- a header-less CSV with
+columns (channel_index, start_sec, end_sec, label_code). label_code is 1-6:
 
-Labels come from a per-RECORDING annotation parquet (path in the "label" column of the
-segment metadata, shared across all 300s chunks of that recording), with columns
-(start, stop, label) in absolute recording-time seconds.
+    1=spsw, 2=gped, 3=pled, 4=eyem, 5=artf, 6=bckg
+
+(channel_index names which channel the event was detected on -- kept as
+metadata only, the label applies to the whole multi-channel window, not just
+that one channel).
+
+Each row of the .rec file is one ~1s-long annotated event; we extract it as a
+[start-PAD_SEC, end+PAD_SEC] window (5s total for a 1s event) from the
+filtered/resampled continuous recording -- one window = one labeled example,
+NOT a grid of fixed-size windows over the whole recording. This matches the
+convention used by BIOT/LaBraM/CBraMod (see
+github.com/ycq091044/BIOT/blob/main/datasets/TUEV/process.py, function
+BuildEvents). Unlike that reference script, events within PAD_SEC of the
+recording's start/end are dropped rather than padded by wrapping the signal
+around on itself -- simpler, and avoids stitching in unrelated signal as fake
+context.
 """
 
 import logging
 from pathlib import Path
 
 import mne
+import numpy as np
 import pandas as pd
 
-from src.data.preprocessing import EEGProcessor, chunk_signal, process_array, write_segment_parquet
-from src.data.utils import get_s3fs
+from src.data.preprocessing import EEGProcessor, process_array, write_segment_parquet
 
 log = logging.getLogger(__name__)
 
-WINDOW_SEC = 5.0
 FS = 128
-CLASSES = ["bckg", "artf", "eyem", "spsw", "gped", "pled"]
-CLASS_MAP = {name: i for i, name in enumerate(CLASSES)}
-
-_ANNOT_CACHE: dict = {}
+PAD_SEC = 2.0
+CLASSES = ["spsw", "gped", "pled", "eyem", "artf", "bckg"]
 
 
 def load_metadata(meta_csv: str) -> pd.DataFrame:
+    """One row per labeled event/window (not per recording)."""
     log.info(f"Reading metadata: {meta_csv}")
     df = pd.read_csv(meta_csv, usecols=[
-        "datalakeID", "label", "subset", "channels", "s3_data_file",
-        "segment_start_sec", "segment_end_sec", "segment_duration_sec",
+        "record_id", "event_id", "label", "subset", "channels", "s3_data_file", "segment_duration_sec",
     ])
-    df = df[df["segment_duration_sec"] >= WINDOW_SEC]
     return df.reset_index(drop=True)
 
 
-def load_annotations(annot_path: str) -> pd.DataFrame:
-    """One (start, stop, label) dataframe per recording, covering its full duration. Cached
-    since every 300s chunk of the same recording points at the same annotation file."""
-    if annot_path not in _ANNOT_CACHE:
-        if annot_path.startswith("s3://"):
-            with get_s3fs().open(annot_path.replace("s3://", ""), "rb") as f:
-                _ANNOT_CACHE[annot_path] = pd.read_parquet(f)
-        else:
-            _ANNOT_CACHE[annot_path] = pd.read_parquet(annot_path)
-    return _ANNOT_CACHE[annot_path]
+def load_annotations(rec_path: str) -> pd.DataFrame:
+    """A TUEV .rec file: header-less CSV, columns (channel, start, stop, label_code)."""
+    arr = np.genfromtxt(rec_path, delimiter=",")
+    if arr.ndim == 1:  # a single-event .rec loads as a 1D array
+        arr = arr.reshape(1, -1)
+    return pd.DataFrame(arr, columns=["channel", "start", "stop", "label_code"])
 
 
-def label_for_window(annots: pd.DataFrame, abs_start: float, abs_end: float) -> str | None:
-    """Return the label of the single annotated interval that fully contains
-    [abs_start, abs_end), or None if the window straddles a boundary / isn't covered."""
-    covering = annots[(annots["start"] <= abs_start) & (annots["stop"] >= abs_end)]
-    if len(covering) != 1:
-        return None
-    return covering.iloc[0]["label"]
+def extract_events(signal: np.ndarray, fs: float, annots: pd.DataFrame,
+                    max_bckg: int | None = None) -> list[tuple[str, np.ndarray]]:
+    """signal: (T, C), already filtered/resampled. Returns [(label, window (T', C)), ...],
+    one per usable row of `annots` (see load_annotations) -- dropped if too close to the
+    recording's start/end (see module docstring), capped for "bckg" via max_bckg."""
+    events = []
+    n_bckg = 0
+    for row in annots.itertuples(index=False):
+        label = CLASSES[int(row.label_code) - 1]
+        start_sample = int(round((row.start - PAD_SEC) * fs))
+        end_sample = int(round((row.stop + PAD_SEC) * fs))
+        if start_sample < 0 or end_sample > signal.shape[0]:
+            continue  # too close to the recording's start/end, see module docstring
+
+        if label == "bckg":
+            if max_bckg is not None and n_bckg >= max_bckg:
+                continue
+            n_bckg += 1
+
+        events.append((label, signal[start_sample:end_sample]))
+    return events
 
 
-def ingest_recording(edf_path: Path, record_id: str, annot_path: Path, subset: str, out_dir: Path,
-                      chunk_sec: float = 300.0, processor: EEGProcessor | None = None) -> list[dict]:
-    """Read one raw continuous TUEV EDF, filter/resample it to 128Hz, cut it into
-    chunk_sec-long segments, and write each as a local parquet. annot_path: a local
-    (start, stop, label) parquet for the whole recording (see load_annotations) --
-    referenced, not copied, since every chunk of this recording shares the same one."""
+def ingest_recording(edf_path: Path, rec_path: Path, subset: str, out_dir: Path,
+                      max_bckg: int | None = None, processor: EEGProcessor | None = None) -> list[dict]:
+    """Read one raw continuous TUEV EDF + its matching .rec annotations, filter/
+    resample to 128Hz, and write one parquet per annotated event."""
+    record_id = edf_path.stem
     raw = mne.io.read_raw_edf(edf_path, preload=True, verbose="ERROR")
     signal, channels, fs = process_array(raw.get_data().T, raw.ch_names, raw.info["sfreq"], processor)
+    annots = load_annotations(rec_path)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     rows = []
-    for start_sec, end_sec, chunk in chunk_signal(signal, fs, chunk_sec):
-        seg_path = out_dir / f"{record_id}_start_sec-{int(start_sec)}.parquet"
-        write_segment_parquet(chunk, channels, seg_path)
+    for i, (label, window) in enumerate(extract_events(signal, fs, annots, max_bckg)):
+        event_id = f"{record_id}_event-{i}"
+        seg_path = out_dir / f"{event_id}.parquet"
+        write_segment_parquet(window, channels, seg_path)
         rows.append({
-            "datalakeID": record_id, "label": str(annot_path), "subset": subset, "channels": channels,
-            "s3_data_file": str(seg_path), "segment_start_sec": start_sec, "segment_end_sec": end_sec,
-            "segment_duration_sec": end_sec - start_sec,
+            "record_id": record_id, "event_id": event_id, "label": label, "subset": subset,
+            "channels": channels, "s3_data_file": str(seg_path), "segment_duration_sec": window.shape[0] / fs,
         })
     return rows
 
 
-def ingest_dataset(raw_dir: Path, annotations_dir: Path, labels_csv: Path, out_dir: Path,
-                    chunk_sec: float = 300.0, processor: EEGProcessor | None = None) -> pd.DataFrame:
-    """raw_dir: one EDF file per recording, named `{record_id}.edf`.
-    annotations_dir: one (start, stop, label) parquet per recording, named `{record_id}.parquet`.
-    labels_csv: columns (record_id, subset) -- TUEV has no whole-recording label (events are
-    labeled per interval, see annotations), only a train/test split to carry over.
+def ingest_dataset(raw_dir: Path, out_dir: Path, max_bckg_per_recording: int | None = 20,
+                    processor: EEGProcessor | None = None) -> pd.DataFrame:
+    """raw_dir: the official TUH EEG Events Corpus layout -- root/{train,eval}/**/*.edf,
+    each with a matching *.rec next to it (see module docstring and docs/datasets.md).
     Writes out_dir/metadata.csv."""
-    labels = pd.read_csv(labels_csv)
     all_rows = []
-    for row in labels.itertuples(index=False):
-        edf_path = Path(raw_dir) / f"{row.record_id}.edf"
-        annot_path = Path(annotations_dir) / f"{row.record_id}.parquet"
-        if not edf_path.exists() or not annot_path.exists():
-            log.warning(f"Skipping {row.record_id}: missing {edf_path} or {annot_path}")
+    for edf_path in sorted(Path(raw_dir).rglob("*.edf")):
+        rec_path = edf_path.with_suffix(".rec")
+        if not rec_path.exists():
+            log.warning(f"Skipping {edf_path}: no matching .rec file")
             continue
-        all_rows.extend(ingest_recording(edf_path, row.record_id, annot_path, row.subset, Path(out_dir),
-                                          chunk_sec, processor))
+        subset = "test" if "eval" in edf_path.parts else "train"
+        all_rows.extend(ingest_recording(edf_path, rec_path, subset, Path(out_dir), max_bckg_per_recording, processor))
 
     meta = pd.DataFrame(all_rows)
     meta.to_csv(Path(out_dir) / "metadata.csv", index=False)
-    log.info(f"Ingested {len(labels)} recordings -> {len(meta)} segments at {out_dir}/metadata.csv")
+    n_recordings = meta["record_id"].nunique() if len(meta) else 0
+    log.info(f"Ingested {n_recordings} recordings -> {len(meta)} events at {out_dir}/metadata.csv")
     return meta

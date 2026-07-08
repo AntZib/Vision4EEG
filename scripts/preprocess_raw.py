@@ -1,14 +1,16 @@
 #!/usr/bin/env python
-"""Turn raw EDF recordings into the 128Hz segment parquets + metadata.csv that
-every other script in this repo consumes (see src/data/{tuab,bci2a,tuev}.py).
+"""Turn raw EDF/GDF recordings into the 128Hz segment parquets + metadata.csv
+that every other script in this repo consumes (see src/data/{tuab,bci2a,tuev}.py).
 
-No external ETL/cloud dependency -- everything runs locally with mne. See
-docs/datasets.md for where to obtain each dataset and how to lay out --raw-dir.
+No external ETL/cloud dependency -- everything runs locally with mne. Each
+dataset's --raw-dir is expected in its official distribution layout (folder
+structure, file naming) -- see docs/datasets.md for exactly what that means
+and where to obtain each dataset.
 
 Usage:
+    python scripts/preprocess_raw.py --dataset tuab --raw-dir data/raw/tuab --out-dir data/processed/tuab
     python scripts/preprocess_raw.py --dataset bci2a --raw-dir data/raw/bci2a --labels-dir data/raw/bci2a_true_labels --out-dir data/processed/bci2a
-    python scripts/preprocess_raw.py --dataset tuab --raw-dir data/raw/tuab --labels-csv data/raw/tuab_labels.csv --out-dir data/processed/tuab
-    python scripts/preprocess_raw.py --dataset tuev --raw-dir data/raw/tuev/edf --annotations-dir data/raw/tuev/annots --labels-csv data/raw/tuev_labels.csv --out-dir data/processed/tuev
+    python scripts/preprocess_raw.py --dataset tuev --raw-dir data/raw/tuev --out-dir data/processed/tuev --max-bckg-per-recording 20
 """
 
 import argparse
@@ -29,16 +31,15 @@ log = setup_logging("preprocess_raw")
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", required=True, choices=["tuab", "bci2a", "tuev"])
-    ap.add_argument("--raw-dir", required=True, help="directory of raw EDF/GDF files (see docstring per dataset)")
-    ap.add_argument("--annotations-dir", default=None, help="TUEV only -- per-recording (start,stop,label) parquets")
-    ap.add_argument("--labels-csv", default=None,
-                     help="TUAB: columns (record_id, label, subset). TUEV: columns (record_id, subset). "
-                          "Not needed for BCI2a (labels come from GDF events / --labels-dir).")
-    ap.add_argument("--labels-dir", default=None,
-                     help="BCI2a only -- true labels for *E.gdf evaluation sessions, see docs/datasets.md "
-                          "(training sessions are labeled directly from their GDF cue events, no dir needed)")
+    ap.add_argument("--raw-dir", required=True,
+                     help="dataset in its official distribution layout -- see docs/datasets.md")
     ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--chunk-sec", type=float, default=300.0, help="TUAB/TUEV only -- segment length before windowing")
+    ap.add_argument("--labels-dir", default=None,
+                     help="BCI2a only -- true labels for *E.gdf evaluation sessions (training sessions are "
+                          "labeled directly from their own GDF cue events, no dir needed for those)")
+    ap.add_argument("--max-bckg-per-recording", type=int, default=20,
+                     help="TUEV only -- cap on 'bckg' events kept per recording (bckg otherwise dominates hugely)")
+    ap.add_argument("--chunk-sec", type=float, default=300.0, help="TUAB only -- segment length before windowing")
     ap.add_argument("--line-freq", type=float, default=None,
                      help="powerline frequency to notch out -- defaults to 50Hz for bci2a (Europe), 60Hz otherwise (US)")
     ap.add_argument("--highpass-hz", type=float, default=0.5)
@@ -54,14 +55,10 @@ def main():
         labels_dir = Path(args.labels_dir) if args.labels_dir else None
         meta = bci2a_data.ingest_dataset(Path(args.raw_dir), out_dir, labels_dir, processor)
     elif args.dataset == "tuab":
-        if not args.labels_csv:
-            ap.error("--labels-csv is required for --dataset tuab")
-        meta = tuab_data.ingest_dataset(Path(args.raw_dir), Path(args.labels_csv), out_dir, chunk_sec=args.chunk_sec)
+        meta = tuab_data.ingest_dataset(Path(args.raw_dir), out_dir, chunk_sec=args.chunk_sec, processor=processor)
     else:  # tuev
-        if not args.labels_csv or not args.annotations_dir:
-            ap.error("--labels-csv and --annotations-dir are required for --dataset tuev")
-        meta = tuev_data.ingest_dataset(Path(args.raw_dir), Path(args.annotations_dir), Path(args.labels_csv),
-                                         out_dir, chunk_sec=args.chunk_sec)
+        meta = tuev_data.ingest_dataset(Path(args.raw_dir), out_dir,
+                                         max_bckg_per_recording=args.max_bckg_per_recording, processor=processor)
 
     log.info(f"Done: {len(meta)} segments written to {out_dir}/metadata.csv")
 

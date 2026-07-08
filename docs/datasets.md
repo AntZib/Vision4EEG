@@ -10,14 +10,14 @@ Source: [TUH Abnormal EEG Corpus](https://isip.piconepress.com/projects/tuh_eeg/
 (free registration + data use agreement, then SFTP access).
 
 ```
-scripts/preprocess_raw.py --dataset tuab \
-    --raw-dir data/raw/tuab --labels-csv data/raw/tuab_labels.csv --out-dir data/processed/tuab
+scripts/preprocess_raw.py --dataset tuab --raw-dir data/raw/tuab --out-dir data/processed/tuab
 ```
 
-- `--raw-dir`: one continuous EDF file per recording, named `{record_id}.edf`.
-- `--labels-csv`: columns `record_id, label, subset` (`label` in `{normal, abnormal}`,
-  `subset` in `{train, validation, test}`) -- this isn't encoded in the EDF itself,
-  it comes from TUAB's own train/eval split and per-recording labels.
+- `--raw-dir`: the corpus in its official layout,
+  `root/{train,eval}/{normal,abnormal}/**/*.edf` (montage-type subfolders in
+  between, e.g. `01_tcp_ar` -- matches the layout used by
+  [BIOT/LaBraM/CBraMod](https://github.com/ycq091044/BIOT/blob/main/datasets/TUAB/process.py)).
+  `label`/`subset` are read directly from that path, no external label file needed.
 
 ## BCI2a -- 4-class motor imagery
 
@@ -54,18 +54,21 @@ Source: [TUH EEG Events Corpus](https://isip.piconepress.com/projects/tuh_eeg/ht
 (free registration + data use agreement, same access as TUAB).
 
 ```
-scripts/preprocess_raw.py --dataset tuev \
-    --raw-dir data/raw/tuev/edf --annotations-dir data/raw/tuev/annots \
-    --labels-csv data/raw/tuev_labels.csv --out-dir data/processed/tuev
+scripts/preprocess_raw.py --dataset tuev --raw-dir data/raw/tuev --out-dir data/processed/tuev
 ```
 
-- `--raw-dir`: one continuous EDF file per recording, named `{record_id}.edf`.
-- `--annotations-dir`: one parquet per recording, named `{record_id}.parquet`, with
-  columns `(start, stop, label)` in absolute recording-time seconds, `label` in
-  `{bckg, artf, eyem, spsw, gped, pled}` -- convert TUEV's native `.rec` annotation
-  files to this format.
-- `--labels-csv`: columns `record_id, subset` (TUEV has no whole-recording label,
-  only a train/test split to carry over).
+- `--raw-dir`: the corpus in its official layout, `root/{train,eval}/**/*.edf`,
+  each EDF with a matching `.rec` file next to it (same basename) -- a
+  header-less CSV with columns `(channel_index, start_sec, end_sec, label_code)`,
+  `label_code` 1-6 for `{spsw, gped, pled, eyem, artf, bckg}`.
+
+Each `.rec` row is one ~1s annotated event; it's cut as a `[start-2s, end+2s]`
+window (5s total) from the recording -- one window = one labeled example, not a
+grid of fixed windows over the whole recording. This matches the convention
+used by [BIOT/LaBraM/CBraMod](https://github.com/ycq091044/BIOT/blob/main/datasets/TUEV/process.py)
+(function `BuildEvents`). `bckg` is capped per recording
+(`--max-bckg-per-recording`, default 20) since it otherwise dominates hugely --
+it's literally "everything else".
 
 ## Local samples used during development
 
