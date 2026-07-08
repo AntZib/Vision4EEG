@@ -6,9 +6,6 @@ pyarrow
 mne
 torch
 
-# optional -- only needed if you read/write s3:// paths
-s3fs
-
 # dev
 pytest
 jupyter

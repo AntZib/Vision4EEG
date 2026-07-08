@@ -43,9 +43,9 @@ def build_split(df, split_name: str, limit: int | None):
         channels = parse_channels(row.channels)
         geom = geom_cache.setdefault(tuple(channels), build_topomap_geometry(channels))
         try:
-            window = read_segment_array(row.s3_data_file)
+            window = read_segment_array(row.data_file)
         except Exception as e:
-            log.warning(f"Skipping {row.s3_data_file}: {e}")
+            log.warning(f"Skipping {row.data_file}: {e}")
             continue
 
         img = window_to_image(window, geom, BANDS, fs=FS)
